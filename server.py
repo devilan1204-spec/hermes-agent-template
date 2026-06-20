@@ -66,6 +66,12 @@ PAIRING_TTL = 3600
 HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
+# Process-efficiency mode for Railway/Telegram-first deployments: the native
+# browser dashboard (and its embedded TUI/node sidecars) is useful for admin, but
+# it is not required for Telegram message handling. Start it lazily on first web
+# request by default instead of burning ~400MB RSS 24/7. Set
+# HERMES_DASHBOARD_AUTOSTART=1 to restore eager boot behavior.
+HERMES_DASHBOARD_AUTOSTART = os.environ.get("HERMES_DASHBOARD_AUTOSTART", "0").lower() in ("1", "true", "yes", "on")
 
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
@@ -1007,6 +1013,9 @@ class Dashboard:
         except Exception as e:
             print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
 
+    def running(self) -> bool:
+        return bool(self.proc and self.proc.returncode is None)
+
     async def _drain(self):
         """Stream subprocess output to Railway logs (prefixed) and a ring buffer."""
         assert self.proc and self.proc.stdout
@@ -1058,8 +1067,27 @@ async def page_index(request: Request):
     return templates.TemplateResponse(request, "index.html")
 
 
+def _gateway_pidfile_live() -> bool:
+    """Best-effort liveness check for a gateway started by any supervisor.
+
+    Railway has two possible gateway supervisors during upgrades: this admin
+    server and the native dashboard sidecar. Health should reflect the actual
+    bot process, not only this server's in-memory gw.state.
+    """
+    try:
+        rec = json.loads((Path(HERMES_HOME) / "gateway.pid").read_text())
+        pid = int(rec.get("pid") or 0)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
 async def route_health(request: Request):
-    return JSONResponse({"status": "ok", "gateway": gw.state})
+    gateway_state = "running" if (gw.state == "running" or _gateway_pidfile_live()) else gw.state
+    return JSONResponse({"status": "ok", "gateway": gateway_state})
 
 
 async def api_config_get(request: Request):
@@ -1106,7 +1134,14 @@ async def api_status(request: Request):
         name: {"configured": bool(v := data.get(key,"")) and v.lower() not in ("false","0","no")}
         for name, key in CHANNEL_MAP.items()
     }
-    return JSONResponse({"gateway": gw.status(), "providers": providers, "channels": channels})
+    gateway_status = gw.status()
+    if gateway_status.get("state") != "running" and _gateway_pidfile_live():
+        gateway_status["state"] = "running"
+        try:
+            gateway_status["pid"] = int(json.loads((Path(HERMES_HOME) / "gateway.pid").read_text()).get("pid") or 0)
+        except Exception:
+            pass
+    return JSONResponse({"gateway": gateway_status, "providers": providers, "channels": channels})
 
 
 async def api_logs(request: Request):
@@ -1292,6 +1327,8 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     Assumes edge auth (basic auth middleware) has already validated the caller.
     HTTP-only: the native Hermes dashboard does not use WebSockets.
     """
+    if not dash.running():
+        await dash.start()
     client = get_http_client()
     target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
     if request.url.query:
@@ -1392,9 +1429,13 @@ async def auto_start():
 
 @asynccontextmanager
 async def lifespan(app):
-    # Dashboard runs always — it's the user-facing UI after setup is done,
-    # and it's independent of gateway state.
-    asyncio.create_task(dash.start())
+    # The gateway is the critical path for Telegram. The dashboard is heavy and
+    # optional, so in Railway/Telegram deployments we start it lazily on first
+    # authenticated web request unless HERMES_DASHBOARD_AUTOSTART=1 is set.
+    if HERMES_DASHBOARD_AUTOSTART:
+        asyncio.create_task(dash.start())
+    else:
+        print("[dashboard] lazy mode enabled — not starting dashboard until first web request", flush=True)
     await auto_start()
     try:
         yield
@@ -1513,6 +1554,8 @@ async def ws_proxy(websocket: WebSocket) -> None:
         upstream_url = f"{upstream_url}?{qs}"
 
     try:
+        if not dash.running():
+            await dash.start()
         upstream = await websockets.connect(
             upstream_url,
             open_timeout=5,
