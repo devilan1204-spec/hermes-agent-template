@@ -219,7 +219,14 @@ def write_config_yaml(data: dict[str, str]) -> None:
 
     # Deployment-managed (always authoritative — these reflect the runtime env).
     merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
-    merged_model["default"] = model
+    # If LLM_MODEL is absent, preserve the dashboard-selected model from
+    # config.yaml. OAuth-based setups (openai-codex/qwen/nous/xai) commonly do
+    # not set LLM_MODEL in .env; overwriting model.default with "" on boot makes
+    # the gateway look unconfigured after a redeploy.
+    if model:
+        merged_model["default"] = model
+    elif not merged_model.get("default"):
+        merged_model["default"] = ""
     # Only force provider="auto" when a known API key is configured. If no
     # API key is set, the user likely configured an OAuth provider (xai-oauth,
     # qwen-oauth, etc.) via the dashboard's model picker — preserve that value
@@ -311,17 +318,52 @@ _XAI_GRANT_TYPE  = "urn:ietf:params:oauth:grant-type:device_code"
 _xai_oauth_state: dict | None = None  # one auth at a time (single-user deployment)
 
 
-def _has_xai_oauth_tokens() -> bool:
-    """True when auth.json contains a valid xAI OAuth refresh token."""
+def _read_auth_json() -> dict:
+    """Best-effort read of Hermes OAuth credential store."""
     auth_path = Path(HERMES_HOME) / "auth.json"
     if not auth_path.exists():
-        return False
+        return {}
     try:
         data = json.loads(auth_path.read_text())
-        tokens = data.get("providers", {}).get("xai-oauth", {}).get("tokens", {})
-        return bool(isinstance(tokens, dict) and tokens.get("refresh_token"))
+        return data if isinstance(data, dict) else {}
     except Exception:
+        return {}
+
+
+def _oauth_provider_has_tokens(provider: str) -> bool:
+    """True when auth.json contains usable-looking tokens for an OAuth provider.
+
+    Railway deployments often use Hermes OAuth providers such as openai-codex,
+    qwen-oauth, nous, or xai-oauth instead of API-key env vars. The setup
+    server must treat those credentials as a configured provider; otherwise a
+    redeploy sees "provider/model not configured" and never starts the gateway.
+    """
+    if not provider:
         return False
+    entry = _read_auth_json().get("providers", {}).get(provider, {})
+    if not isinstance(entry, dict):
+        return False
+    tokens = entry.get("tokens") if isinstance(entry.get("tokens"), dict) else entry
+    return any(tokens.get(k) for k in ("refresh_token", "access_token", "id_token"))
+
+
+def _has_xai_oauth_tokens() -> bool:
+    """True when auth.json contains a valid xAI OAuth refresh token."""
+    return _oauth_provider_has_tokens("xai-oauth")
+
+
+def _configured_model_from_yaml() -> tuple[str, str]:
+    """Return (model, provider) from config.yaml, if present."""
+    try:
+        import yaml
+        config_path = Path(HERMES_HOME) / "config.yaml"
+        loaded = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+        model_cfg = loaded.get("model", {}) if isinstance(loaded, dict) else {}
+        if not isinstance(model_cfg, dict):
+            return "", ""
+        return str(model_cfg.get("default") or ""), str(model_cfg.get("provider") or "")
+    except Exception:
+        return "", ""
 
 
 def _save_xai_auth_json(tokens: dict) -> None:
@@ -550,8 +592,16 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """
     if data is None:
         data = read_env(ENV_FILE)
-    has_model = bool(data.get("LLM_MODEL"))
-    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or _has_xai_oauth_tokens()
+    yaml_model, yaml_provider = _configured_model_from_yaml()
+    model = data.get("LLM_MODEL") or yaml_model
+    provider = yaml_provider
+    has_model = bool(model)
+    has_api_key_provider = any(data.get(k) for k in PROVIDER_KEYS)
+    # OAuth providers keep credentials in auth.json rather than provider API-key
+    # env vars. Accept the provider selected in config.yaml when it has stored
+    # tokens; this keeps Railway redeploys from leaving the gateway stopped.
+    has_oauth_provider = _oauth_provider_has_tokens(provider)
+    has_provider = has_api_key_provider or has_oauth_provider or _has_xai_oauth_tokens()
     return has_model and has_provider
 
 
