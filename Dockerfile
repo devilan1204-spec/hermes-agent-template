@@ -19,13 +19,16 @@ ARG HERMES_REF=v2026.6.5
 # stop signal still triggers our graceful shutdown. Standard container init
 # (same as Docker's `--init` flag and Kubernetes' pause container).
 #
-# Node.js is required only at build time to compile the Hermes React dashboard.
-# We strip the source + apt lists afterwards to keep the image lean.
+# Node.js is required at build time to compile the Hermes React dashboard and
+# at runtime for the embedded TUI. We also bake operational CLIs into the image
+# so Railway/GitHub recovery work survives redeploys: gh, railway, jq, unzip.
+# We strip package manager caches afterwards to keep the image lean.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git tini && \
+    apt-get install -y --no-install-recommends curl ca-certificates git tini gh jq unzip && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
+    npm install -g @railway/cli@latest --silent --no-fund --no-audit --progress=false && \
+    rm -rf /var/lib/apt/lists/* /root/.npm
 
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
