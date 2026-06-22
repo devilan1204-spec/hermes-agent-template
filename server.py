@@ -35,6 +35,7 @@ import re
 import secrets
 import signal
 import time
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -986,6 +987,458 @@ gw = Gateway()
 cfg_lock = asyncio.Lock()
 
 
+# ── Legion command bus ────────────────────────────────────────────────────────
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+TASK_PENDING_STATES = ("pending", "queued", "ready", "new")
+TASK_RUNNING_STATE = "running"
+TASK_DONE_STATE = "completed"
+TASK_FAILED_STATE = "failed"
+
+
+def _env_value(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return ""
+
+
+def _legion_transport() -> str:
+    return _env_value("COMMAND_TRANSPORT", "LEGION_COMMAND_SOURCE", "LEGION_REPORT_TRANSPORT")
+
+
+def _legion_enabled() -> bool:
+    transport = _legion_transport().lower()
+    return bool(transport and ("postgres" in transport or "redis" in transport or "http" in transport))
+
+
+def _quote_ident(name: str) -> str:
+    if not _IDENT_RE.match(name or ""):
+        raise ValueError(f"Unsafe SQL identifier: {name!r}")
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _legion_agent_id() -> str:
+    return _env_value("LEGION_AGENT_ID", "AGENT_ID", "RAILWAY_SERVICE_NAME") or "hermes-worker"
+
+
+def _legion_id() -> str:
+    return _env_value("LEGION_ID") or _legion_agent_id().split("-", 1)[0] or "legion"
+
+
+def _legion_schema() -> str:
+    explicit = _env_value("POSTGRES_SCHEMA", "LEGION_POSTGRES_SCHEMA", "DATABASE_SCHEMA")
+    if explicit:
+        return explicit
+    agent = _legion_agent_id().lower()
+    cleaned = re.sub(r"[^a-z0-9]+", "_", agent).strip("_")
+    return cleaned if cleaned.startswith("legion_") else f"legion_{cleaned or 'worker'}"
+
+
+def _legion_redis_prefix() -> str:
+    return _env_value("REDIS_KEY_PREFIX", "LEGION_REDIS_PREFIX") or _legion_schema()
+
+
+def _task_prompt(task: dict) -> str:
+    return "\n".join([
+        "You are a Railway-hosted Hermes legion worker.",
+        f"Legion: {_legion_id()}",
+        f"Agent: {_legion_agent_id()}",
+        f"Work order: {task.get('work_order_id') or ''}",
+        f"Task: {task.get('task_id') or ''}",
+        f"Type: {task.get('task_type') or 'general'}",
+        "",
+        "Execute the instruction. Return a concise Korean operational report with concrete outputs, blockers, and verification evidence.",
+        "",
+        "Instruction:",
+        str(task.get("instruction") or "").strip(),
+    ])
+
+
+class LegionCommandBus:
+    """Postgres-backed worker loop for Railway legion services.
+
+    Railway service links and env vars are not enough by themselves: a worker has
+    to heartbeat, claim tasks, execute them, and write results back. This bus is
+    deliberately conservative: Postgres is the source of truth, Redis is only an
+    optional wake-up/status side channel, and all SQL identifiers are allowlisted.
+    """
+
+    def __init__(self):
+        self.task: asyncio.Task | None = None
+        self.state = "stopped"
+        self.last_error = ""
+        self.last_task_id = ""
+        self.last_heartbeat_at: float | None = None
+        self.processed = 0
+        self.failed = 0
+
+    def should_start(self) -> bool:
+        if _falsey(os.environ.get("LEGION_COMMAND_BUS_ENABLED")):
+            return False
+        if not _legion_enabled():
+            return False
+        # Commander services may still run a gateway. They can use the enqueue
+        # API, but should not consume worker tasks unless explicitly requested.
+        return (
+            _truthy(os.environ.get("WORKER_MODE"))
+            or _truthy(os.environ.get("LEGION_WORKER_MODE"))
+            or _falsey(os.environ.get("TELEGRAM_GATEWAY_ENABLED"))
+            or not bool(os.environ.get("TELEGRAM_BOT_TOKEN"))
+        )
+
+    async def start(self) -> None:
+        if self.task and not self.task.done():
+            return
+        if not self.should_start():
+            self.state = "disabled"
+            return
+        self.state = "starting"
+        self.task = asyncio.create_task(self._run(), name="legion-command-bus")
+
+    async def stop(self) -> None:
+        if self.task and not self.task.done():
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        self.state = "stopped"
+
+    def status(self) -> dict:
+        return {
+            "enabled": self.should_start(),
+            "state": self.state,
+            "transport": _legion_transport(),
+            "agent_id": _legion_agent_id(),
+            "legion_id": _legion_id(),
+            "postgres_schema": _legion_schema(),
+            "redis_key_prefix": _legion_redis_prefix(),
+            "database_configured": bool(os.environ.get("DATABASE_URL")),
+            "redis_configured": bool(os.environ.get("REDIS_URL")),
+            "last_error": self.last_error,
+            "last_task_id": self.last_task_id,
+            "last_heartbeat_at": self.last_heartbeat_at,
+            "processed": self.processed,
+            "failed": self.failed,
+        }
+
+    async def _run(self) -> None:
+        self.state = "running"
+        poll_seconds = max(2, int(os.environ.get("LEGION_POLL_SECONDS", "10")))
+        while True:
+            try:
+                await asyncio.to_thread(self._ensure_schema)
+                await asyncio.to_thread(self._heartbeat, "idle")
+                task = await asyncio.to_thread(self._claim_next_task)
+                if task:
+                    await self._execute_task(task)
+                else:
+                    await self._publish_redis_status("idle")
+                    await asyncio.sleep(poll_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.state = "error"
+                self.last_error = repr(exc)
+                print(f"[legion-bus] error: {exc!r}", flush=True)
+                await asyncio.sleep(min(30, poll_seconds * 2))
+                self.state = "running"
+
+    def _connect(self):
+        import psycopg
+        url = os.environ.get("DATABASE_URL")
+        if not url:
+            raise RuntimeError("DATABASE_URL is required for legion command bus")
+        return psycopg.connect(url, autocommit=True)
+
+    def _ensure_schema(self) -> None:
+        self._ensure_schema_name(_legion_schema())
+
+    def _ensure_schema_name(self, schema_name: str) -> None:
+        schema = _quote_ident(schema_name)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {schema}.work_orders (
+                    work_order_id text PRIMARY KEY,
+                    legion_id text,
+                    commander_agent_id text,
+                    title text,
+                    objective text,
+                    priority text DEFAULT 'normal',
+                    status text DEFAULT 'pending',
+                    quality_gate_required boolean DEFAULT false,
+                    created_at timestamptz DEFAULT now(),
+                    updated_at timestamptz DEFAULT now()
+                )
+            """)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {schema}.tasks (
+                    task_id text PRIMARY KEY,
+                    work_order_id text,
+                    legion_id text,
+                    agent_id text,
+                    task_type text,
+                    instruction text,
+                    status text DEFAULT 'pending',
+                    priority text DEFAULT 'normal',
+                    redis_queue_key text,
+                    created_at timestamptz DEFAULT now(),
+                    updated_at timestamptz DEFAULT now()
+                )
+            """)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {schema}.artifacts (
+                    artifact_id text PRIMARY KEY,
+                    work_order_id text,
+                    task_id text,
+                    legion_id text,
+                    agent_id text,
+                    artifact_type text,
+                    r2_key text,
+                    title text,
+                    mime_type text,
+                    size_bytes bigint,
+                    metadata jsonb,
+                    created_at timestamptz DEFAULT now()
+                )
+            """)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {schema}.agent_status (
+                    agent_id text PRIMARY KEY,
+                    legion_id text,
+                    role text,
+                    status text,
+                    redis_key_prefix text,
+                    postgres_schema text,
+                    r2_prefix text,
+                    last_heartbeat_at timestamptz DEFAULT now(),
+                    updated_at timestamptz DEFAULT now()
+                )
+            """)
+
+    def _heartbeat(self, status: str) -> None:
+        schema = _quote_ident(_legion_schema())
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.agent_status
+                    (agent_id, legion_id, role, status, redis_key_prefix, postgres_schema, r2_prefix, last_heartbeat_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (agent_id) DO UPDATE SET
+                    legion_id=EXCLUDED.legion_id,
+                    role=EXCLUDED.role,
+                    status=EXCLUDED.status,
+                    redis_key_prefix=EXCLUDED.redis_key_prefix,
+                    postgres_schema=EXCLUDED.postgres_schema,
+                    r2_prefix=EXCLUDED.r2_prefix,
+                    last_heartbeat_at=now(),
+                    updated_at=now()
+                """,
+                (_legion_agent_id(), _legion_id(), os.environ.get("LEGION_ROLE", "worker"), status, _legion_redis_prefix(), _legion_schema(), os.environ.get("R2_PREFIX", "")),
+            )
+        self.last_heartbeat_at = time.time()
+
+    def _claim_next_task(self) -> dict | None:
+        schema = _quote_ident(_legion_schema())
+        with self._connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT task_id, work_order_id, legion_id, agent_id, task_type, instruction, status, priority
+                        FROM {schema}.tasks
+                        WHERE status = ANY(%s)
+                          AND (agent_id IS NULL OR agent_id = '' OR agent_id = %s)
+                        ORDER BY
+                          CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+                          created_at
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (list(TASK_PENDING_STATES), _legion_agent_id()),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    task_id = row[0]
+                    cur.execute(
+                        f"UPDATE {schema}.tasks SET status=%s, agent_id=%s, updated_at=now() WHERE task_id=%s",
+                        (TASK_RUNNING_STATE, _legion_agent_id(), task_id),
+                    )
+                    if row[1]:
+                        cur.execute(
+                            f"UPDATE {schema}.work_orders SET status=%s, updated_at=now() WHERE work_order_id=%s",
+                            (TASK_RUNNING_STATE, row[1]),
+                        )
+                    return {
+                        "task_id": row[0],
+                        "work_order_id": row[1],
+                        "legion_id": row[2],
+                        "agent_id": row[3],
+                        "task_type": row[4],
+                        "instruction": row[5],
+                        "status": row[6],
+                        "priority": row[7],
+                    }
+
+    async def _execute_task(self, task: dict) -> None:
+        task_id = str(task.get("task_id") or "")
+        self.last_task_id = task_id
+        await asyncio.to_thread(self._heartbeat, "busy")
+        await self._publish_redis_status("busy", task_id=task_id)
+        timeout = max(60, int(os.environ.get("LEGION_TASK_TIMEOUT_SECONDS", "900")))
+        env = {**os.environ, "HERMES_HOME": HERMES_HOME}
+        env.update(read_env(ENV_FILE))
+        prompt = _task_prompt(task)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "hermes", "chat", "-q", prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            output = raw.decode(errors="replace")[-20000:]
+            if proc.returncode == 0:
+                await asyncio.to_thread(self._finish_task, task, TASK_DONE_STATE, output, None)
+                self.processed += 1
+            else:
+                await asyncio.to_thread(self._finish_task, task, TASK_FAILED_STATE, output, f"hermes exited {proc.returncode}")
+                self.failed += 1
+        except Exception as exc:
+            await asyncio.to_thread(self._finish_task, task, TASK_FAILED_STATE, "", repr(exc))
+            self.failed += 1
+        finally:
+            await asyncio.to_thread(self._heartbeat, "idle")
+            await self._publish_redis_status("idle")
+
+    def _finish_task(self, task: dict, status: str, output: str, error: str | None) -> None:
+        schema = _quote_ident(_legion_schema())
+        artifact_id = f"artifact-{uuid.uuid4().hex}"
+        metadata = {"output": output, "error": error, "status": status}
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {schema}.tasks SET status=%s, updated_at=now() WHERE task_id=%s",
+                (status, task.get("task_id")),
+            )
+            if task.get("work_order_id"):
+                cur.execute(
+                    f"UPDATE {schema}.work_orders SET status=%s, updated_at=now() WHERE work_order_id=%s",
+                    (status, task.get("work_order_id")),
+                )
+            cur.execute(
+                f"""
+                INSERT INTO {schema}.artifacts
+                    (artifact_id, work_order_id, task_id, legion_id, agent_id, artifact_type, r2_key, title, mime_type, size_bytes, metadata, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
+                """,
+                (
+                    artifact_id,
+                    task.get("work_order_id"),
+                    task.get("task_id"),
+                    _legion_id(),
+                    _legion_agent_id(),
+                    "hermes_task_result",
+                    f"{os.environ.get('R2_PREFIX', _legion_schema()).strip('/')}/artifacts/{artifact_id}.json",
+                    f"Task result {task.get('task_id')}",
+                    "application/json",
+                    len(output.encode()),
+                    json.dumps(metadata, ensure_ascii=False),
+                ),
+            )
+        if error:
+            self.last_error = error
+
+    async def _publish_redis_status(self, status: str, *, task_id: str = "") -> None:
+        if not os.environ.get("REDIS_URL"):
+            return
+        try:
+            await asyncio.to_thread(self._publish_redis_status_sync, status, task_id)
+        except Exception as exc:
+            self.last_error = repr(exc)
+
+    def _publish_redis_status_sync(self, status: str, task_id: str = "") -> None:
+        import redis
+        client = redis.Redis.from_url(os.environ["REDIS_URL"], socket_connect_timeout=2, socket_timeout=2)
+        key = f"{_legion_redis_prefix()}:agent:{_legion_agent_id()}:status"
+        payload = {
+            "agent_id": _legion_agent_id(),
+            "legion_id": _legion_id(),
+            "status": status,
+            "task_id": task_id,
+            "postgres_schema": _legion_schema(),
+            "updated_at": str(int(time.time())),
+        }
+        client.hset(key, mapping=payload)
+        client.expire(key, 300)
+
+
+legion_bus = LegionCommandBus()
+
+
+async def api_legion_status(request: Request):
+    return JSONResponse(legion_bus.status())
+
+
+async def api_legion_enqueue(request: Request):
+    # Internal API: allow either admin cookie or a shared bearer token.
+    shared_secret = os.environ.get("LEGION_SHARED_SECRET") or os.environ.get("COMMAND_API_TOKEN")
+    auth = request.headers.get("authorization", "")
+    if not _is_authenticated(request) and not (shared_secret and _hmac.compare_digest(auth, f"Bearer {shared_secret}")):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+        target_schema = body.get("postgres_schema") or body.get("schema") or _legion_schema()
+        _quote_ident(target_schema)
+        work_order_id = body.get("work_order_id") or f"wo-{uuid.uuid4().hex}"
+        task_id = body.get("task_id") or f"task-{uuid.uuid4().hex}"
+        title = body.get("title") or "Commander work order"
+        instruction = body.get("instruction") or body.get("objective") or ""
+        if not instruction.strip():
+            return JSONResponse({"error": "instruction is required"}, status_code=400)
+        await asyncio.to_thread(_enqueue_task_sync, target_schema, work_order_id, task_id, title, instruction, body)
+        return JSONResponse({"ok": True, "postgres_schema": target_schema, "work_order_id": work_order_id, "task_id": task_id})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+def _enqueue_task_sync(schema_name: str, work_order_id: str, task_id: str, title: str, instruction: str, body: dict) -> None:
+    schema = _quote_ident(schema_name)
+    legion_bus._ensure_schema_name(schema_name)
+    with legion_bus._connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {schema}.work_orders
+                (work_order_id, legion_id, commander_agent_id, title, objective, priority, status, quality_gate_required, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, now(), now())
+            ON CONFLICT (work_order_id) DO UPDATE SET
+                title=EXCLUDED.title,
+                objective=EXCLUDED.objective,
+                priority=EXCLUDED.priority,
+                status='pending',
+                updated_at=now()
+            """,
+            (work_order_id, body.get("legion_id") or _legion_id(), _legion_agent_id(), title, body.get("objective") or instruction, body.get("priority") or "normal", bool(body.get("quality_gate_required", False))),
+        )
+        cur.execute(
+            f"""
+            INSERT INTO {schema}.tasks
+                (task_id, work_order_id, legion_id, agent_id, task_type, instruction, status, priority, redis_queue_key, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s, now(), now())
+            ON CONFLICT (task_id) DO UPDATE SET
+                instruction=EXCLUDED.instruction,
+                status='pending',
+                priority=EXCLUDED.priority,
+                updated_at=now()
+            """,
+            (task_id, work_order_id, body.get("legion_id") or _legion_id(), body.get("agent_id") or "", body.get("task_type") or "general", instruction, body.get("priority") or "normal", body.get("redis_queue_key") or f"{schema_name}:tasks"),
+        )
+
+
 # ── Hermes dashboard subprocess ───────────────────────────────────────────────
 class Dashboard:
     """Manages the `hermes dashboard` subprocess (native Hermes web UI).
@@ -1113,7 +1566,8 @@ async def route_health(request: Request):
         "gateway": gateway_state,
         "gateway_enabled": gateway_enabled(),
         "worker_mode": _truthy(os.environ.get("WORKER_MODE")),
-        "transport": os.environ.get("COMMAND_TRANSPORT") or os.environ.get("LEGION_COMMAND_SOURCE") or "",
+        "transport": _legion_transport(),
+        "command_bus": legion_bus.status(),
     })
 
 
@@ -1471,12 +1925,14 @@ async def lifespan(app):
     else:
         print("[dashboard] lazy mode enabled — not starting dashboard until first web request", flush=True)
     await auto_start()
+    await legion_bus.start()
     try:
         yield
     finally:
         await asyncio.gather(
             gw.stop(),
             dash.stop(),
+            legion_bus.stop(),
             return_exceptions=True,
         )
         global _http_client
@@ -1642,6 +2098,8 @@ ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 routes = [
     # Public — no auth required.
     Route("/health",                            route_health),
+    Route("/legion/api/status",                 api_legion_status),
+    Route("/legion/api/tasks",                  api_legion_enqueue,  methods=["POST"]),
     Route("/login",                             page_login,          methods=["GET"]),
     Route("/login",                             login_post,          methods=["POST"]),
     Route("/logout",                            logout),
