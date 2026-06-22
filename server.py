@@ -69,11 +69,12 @@ HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
 # Process-efficiency mode for Railway/Telegram-first deployments: the native
-# browser dashboard (and its embedded TUI/node sidecars) is useful for admin, but
+# Dashboard is optional on worker/commander services used primarily over Telegram;
 # it is not required for Telegram message handling. Start it lazily on first web
 # request by default instead of burning ~400MB RSS 24/7. Set
 # HERMES_DASHBOARD_AUTOSTART=1 to restore eager boot behavior.
 HERMES_DASHBOARD_AUTOSTART = os.environ.get("HERMES_DASHBOARD_AUTOSTART", "0").lower() in ("1", "true", "yes", "on")
+HERMES_DASHBOARD_READY_TIMEOUT = float(os.environ.get("HERMES_DASHBOARD_READY_TIMEOUT", "15"))
 
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
@@ -1735,6 +1736,31 @@ class Dashboard:
     def running(self) -> bool:
         return bool(self.proc and self.proc.returncode is None)
 
+    async def wait_ready(self, timeout: float = HERMES_DASHBOARD_READY_TIMEOUT) -> bool:
+        """Wait until the loopback dashboard accepts HTTP requests.
+
+        Lazy dashboard startup saves memory on Telegram-first Railway services,
+        but the first authenticated browser request used to race the subprocess
+        and return a transient 503. Polling readiness here keeps lazy mode while
+        avoiding a user-visible false outage.
+        """
+        if not self.running():
+            return False
+        deadline = time.monotonic() + max(timeout, 0.1)
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                client = get_http_client()
+                response = await client.get(HERMES_DASHBOARD_URL)
+                await response.aclose()
+                return True
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.25)
+        if last_error:
+            print(f"[dashboard] readiness wait timed out: {last_error!r}", flush=True)
+        return False
+
     async def _drain(self):
         """Stream subprocess output to Railway logs (prefixed) and a ring buffer."""
         assert self.proc and self.proc.stdout
@@ -2068,6 +2094,8 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     """
     if not dash.running():
         await dash.start()
+    if not await dash.wait_ready():
+        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
     client = get_http_client()
     target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
     if request.url.query:
