@@ -1007,9 +1007,15 @@ def _legion_transport() -> str:
     return _env_value("COMMAND_TRANSPORT", "LEGION_COMMAND_SOURCE", "LEGION_REPORT_TRANSPORT")
 
 
-def _legion_enabled() -> bool:
+def _legion_transport_declared() -> bool:
     transport = _legion_transport().lower()
     return bool(transport and ("postgres" in transport or "redis" in transport or "http" in transport))
+
+
+def _legion_worker_bus_configured() -> bool:
+    """True only when this process can actually poll/execute Postgres tasks."""
+    transport = _legion_transport().lower()
+    return "postgres" in transport and bool(os.environ.get("DATABASE_URL"))
 
 
 def _quote_ident(name: str) -> str:
@@ -1076,7 +1082,7 @@ class LegionCommandBus:
     def should_start(self) -> bool:
         if _falsey(os.environ.get("LEGION_COMMAND_BUS_ENABLED")):
             return False
-        if not _legion_enabled():
+        if not _legion_worker_bus_configured():
             return False
         # Commander services may still run a gateway. They can use the enqueue
         # API, but should not consume worker tasks unless explicitly requested.
@@ -1114,6 +1120,7 @@ class LegionCommandBus:
             "legion_id": _legion_id(),
             "postgres_schema": _legion_schema(),
             "redis_key_prefix": _legion_redis_prefix(),
+            "transport_configured": _legion_transport_declared(),
             "database_configured": bool(os.environ.get("DATABASE_URL")),
             "redis_configured": bool(os.environ.get("REDIS_URL")),
             "last_error": self.last_error,
@@ -1314,10 +1321,74 @@ class LegionCommandBus:
             await asyncio.to_thread(self._heartbeat, "idle")
             await self._publish_redis_status("idle")
 
+    def _r2_config(self) -> dict[str, str]:
+        account_id = _env_value("R2_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID")
+        endpoint = _env_value("R2_ENDPOINT_URL", "S3_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3")
+        if not endpoint and account_id:
+            endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
+        return {
+            "bucket": _env_value("R2_BUCKET", "R2_BUCKET_NAME", "CLOUDFLARE_R2_BUCKET", "S3_BUCKET"),
+            "endpoint_url": endpoint,
+            "access_key_id": _env_value("R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+            "secret_access_key": _env_value("R2_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+            "region_name": _env_value("R2_REGION", "AWS_DEFAULT_REGION") or "auto",
+        }
+
+    def _store_artifact_payload(self, artifact_id: str, task: dict, status: str, output: str, error: str | None) -> tuple[str, int, dict]:
+        payload = {
+            "artifact_id": artifact_id,
+            "work_order_id": task.get("work_order_id"),
+            "task_id": task.get("task_id"),
+            "legion_id": _legion_id(),
+            "agent_id": _legion_agent_id(),
+            "status": status,
+            "error": error,
+            "output": output,
+            "created_at": int(time.time()),
+        }
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode()
+        prefix = os.environ.get("R2_PREFIX", _legion_schema()).strip("/")
+        object_key = f"{prefix}/artifacts/{artifact_id}.json" if prefix else f"artifacts/{artifact_id}.json"
+        metadata = {
+            "status": status,
+            "error": error,
+            "storage": "postgres_inline",
+            "output": output,
+        }
+        cfg = self._r2_config()
+        if all(cfg.get(k) for k in ("bucket", "endpoint_url", "access_key_id", "secret_access_key")):
+            try:
+                import boto3
+                client = boto3.client(
+                    "s3",
+                    endpoint_url=cfg["endpoint_url"],
+                    aws_access_key_id=cfg["access_key_id"],
+                    aws_secret_access_key=cfg["secret_access_key"],
+                    region_name=cfg["region_name"],
+                )
+                client.put_object(
+                    Bucket=cfg["bucket"],
+                    Key=object_key,
+                    Body=body,
+                    ContentType="application/json; charset=utf-8",
+                )
+                metadata = {
+                    "status": status,
+                    "error": error,
+                    "storage": "r2",
+                    "bucket": cfg["bucket"],
+                    "output_preview": output[:4000],
+                }
+                return object_key, len(body), metadata
+            except Exception as exc:
+                metadata["r2_upload_error"] = repr(exc)
+                self.last_error = repr(exc)
+        return "", len(body), metadata
+
     def _finish_task(self, task: dict, status: str, output: str, error: str | None) -> None:
         schema = _quote_ident(_legion_schema())
         artifact_id = f"artifact-{uuid.uuid4().hex}"
-        metadata = {"output": output, "error": error, "status": status}
+        r2_key, size_bytes, metadata = self._store_artifact_payload(artifact_id, task, status, output, error)
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 f"UPDATE {schema}.tasks SET status=%s, updated_at=now() WHERE task_id=%s",
@@ -1341,10 +1412,10 @@ class LegionCommandBus:
                     _legion_id(),
                     _legion_agent_id(),
                     "hermes_task_result",
-                    f"{os.environ.get('R2_PREFIX', _legion_schema()).strip('/')}/artifacts/{artifact_id}.json",
+                    r2_key,
                     f"Task result {task.get('task_id')}",
                     "application/json",
-                    len(output.encode()),
+                    size_bytes,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
             )
@@ -1378,15 +1449,21 @@ class LegionCommandBus:
 legion_bus = LegionCommandBus()
 
 
+def _legion_api_authorized(request: Request) -> bool:
+    shared_secret = os.environ.get("LEGION_SHARED_SECRET") or os.environ.get("COMMAND_API_TOKEN")
+    auth = request.headers.get("authorization", "")
+    return _is_authenticated(request) or bool(shared_secret and _hmac.compare_digest(auth, f"Bearer {shared_secret}"))
+
+
 async def api_legion_status(request: Request):
+    if not _legion_api_authorized(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return JSONResponse(legion_bus.status())
 
 
 async def api_legion_enqueue(request: Request):
     # Internal API: allow either admin cookie or a shared bearer token.
-    shared_secret = os.environ.get("LEGION_SHARED_SECRET") or os.environ.get("COMMAND_API_TOKEN")
-    auth = request.headers.get("authorization", "")
-    if not _is_authenticated(request) and not (shared_secret and _hmac.compare_digest(auth, f"Bearer {shared_secret}")):
+    if not _legion_api_authorized(request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     try:
         body = await request.json()
