@@ -1,4 +1,6 @@
+import asyncio
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -31,6 +33,7 @@ def load_server(tmp_path, monkeypatch):
         "CLOUDFLARE_R2_BUCKET",
         "S3_BUCKET",
         "R2_ENDPOINT_URL",
+        "R2_ENDPOINT",
         "S3_ENDPOINT_URL",
         "AWS_ENDPOINT_URL_S3",
         "R2_ACCOUNT_ID",
@@ -139,3 +142,66 @@ def test_artifact_storage_does_not_fake_r2_key_without_r2_config(tmp_path, monke
     assert size_bytes > 0
     assert metadata["storage"] == "postgres_inline"
     assert metadata["output"] == "작업 완료"
+
+
+def test_r2_config_accepts_r2_endpoint_env_name(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("R2_ENDPOINT", "https://example.r2.cloudflarestorage.com")
+    monkeypatch.setenv("R2_BUCKET", "bucket")
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "access")
+    monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "secret")
+
+    cfg = server.legion_bus._r2_config()
+
+    assert cfg["endpoint_url"] == "https://example.r2.cloudflarestorage.com"
+    assert cfg["bucket"] == "bucket"
+
+
+class DummyRequest:
+    def __init__(self, headers=None, cookies=None):
+        self.headers = headers or {}
+        self.cookies = cookies or {}
+
+
+def test_legion_status_requires_auth(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+
+    response = asyncio.run(server.api_legion_status(DummyRequest()))
+
+    assert response.status_code == 401
+    assert json.loads(response.body)["error"] == "Unauthorized"
+
+
+def test_legion_status_accepts_bearer_token(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("COMMAND_API_TOKEN", "shared-secret")
+
+    response = asyncio.run(server.api_legion_status(DummyRequest(headers={"authorization": "Bearer shared-secret"})))
+
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert "agent_id" in body
+    assert "last_error" in body
+
+
+def test_health_omits_private_command_bus_details(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("COMMAND_TRANSPORT", "http_redis_postgres")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+    monkeypatch.setenv("POSTGRES_SCHEMA", "legion_private_schema")
+    server.legion_bus.last_error = "private failure detail"
+    server.legion_bus.last_task_id = "task-secret"
+
+    response = asyncio.run(server.route_health(DummyRequest()))
+    body = json.loads(response.body)
+    command_bus = body["command_bus"]
+
+    assert response.status_code == 200
+    assert "postgres_schema" not in command_bus
+    assert "redis_key_prefix" not in command_bus
+    assert "agent_id" not in command_bus
+    assert "last_error" not in command_bus
+    assert "last_task_id" not in command_bus
+    assert command_bus["database_configured"] is True
+    assert command_bus["redis_configured"] is True

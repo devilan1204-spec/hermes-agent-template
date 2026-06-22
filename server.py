@@ -1018,6 +1018,25 @@ def _legion_worker_bus_configured() -> bool:
     return "postgres" in transport and bool(os.environ.get("DATABASE_URL"))
 
 
+def _legion_disabled_reason() -> str:
+    if _falsey(os.environ.get("LEGION_COMMAND_BUS_ENABLED")):
+        return "LEGION_COMMAND_BUS_ENABLED=false"
+    if not _legion_transport_declared():
+        return "command transport not configured"
+    if "postgres" not in _legion_transport().lower():
+        return "postgres transport required for worker polling"
+    if not os.environ.get("DATABASE_URL"):
+        return "DATABASE_URL not configured"
+    if not (
+        _truthy(os.environ.get("WORKER_MODE"))
+        or _truthy(os.environ.get("LEGION_WORKER_MODE"))
+        or _falsey(os.environ.get("TELEGRAM_GATEWAY_ENABLED"))
+        or not bool(os.environ.get("TELEGRAM_BOT_TOKEN"))
+    ):
+        return "gateway service is not in worker polling mode"
+    return ""
+
+
 def _quote_ident(name: str) -> str:
     if not _IDENT_RE.match(name or ""):
         raise ValueError(f"Unsafe SQL identifier: {name!r}")
@@ -1114,7 +1133,9 @@ class LegionCommandBus:
     def status(self) -> dict:
         return {
             "enabled": self.should_start(),
+            "polling_enabled": self.should_start(),
             "state": self.state,
+            "disabled_reason": "" if self.should_start() else _legion_disabled_reason(),
             "transport": _legion_transport(),
             "agent_id": _legion_agent_id(),
             "legion_id": _legion_id(),
@@ -1323,7 +1344,7 @@ class LegionCommandBus:
 
     def _r2_config(self) -> dict[str, str]:
         account_id = _env_value("R2_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID")
-        endpoint = _env_value("R2_ENDPOINT_URL", "S3_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3")
+        endpoint = _env_value("R2_ENDPOINT_URL", "R2_ENDPOINT", "S3_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3")
         if not endpoint and account_id:
             endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
         return {
@@ -1359,12 +1380,15 @@ class LegionCommandBus:
         if all(cfg.get(k) for k in ("bucket", "endpoint_url", "access_key_id", "secret_access_key")):
             try:
                 import boto3
+                from botocore.config import Config
+
                 client = boto3.client(
                     "s3",
                     endpoint_url=cfg["endpoint_url"],
                     aws_access_key_id=cfg["access_key_id"],
                     aws_secret_access_key=cfg["secret_access_key"],
                     region_name=cfg["region_name"],
+                    config=Config(connect_timeout=5, read_timeout=20, retries={"max_attempts": 2}),
                 )
                 client.put_object(
                     Bucket=cfg["bucket"],
@@ -1382,6 +1406,7 @@ class LegionCommandBus:
                 return object_key, len(body), metadata
             except Exception as exc:
                 metadata["r2_upload_error"] = repr(exc)
+                metadata["artifact_storage_degraded"] = True
                 self.last_error = repr(exc)
         return "", len(body), metadata
 
@@ -1638,13 +1663,22 @@ def _gateway_pidfile_live() -> bool:
 
 async def route_health(request: Request):
     gateway_state = "running" if gateway_enabled() and (gw.state == "running" or _gateway_pidfile_live()) else gw.state
+    bus_enabled = legion_bus.should_start()
     return JSONResponse({
         "status": "ok",
         "gateway": gateway_state,
         "gateway_enabled": gateway_enabled(),
         "worker_mode": _truthy(os.environ.get("WORKER_MODE")),
         "transport": _legion_transport(),
-        "command_bus": legion_bus.status(),
+        "command_bus": {
+            "enabled": bus_enabled,
+            "polling_enabled": bus_enabled,
+            "state": legion_bus.state,
+            "disabled_reason": "" if bus_enabled else _legion_disabled_reason(),
+            "transport_configured": _legion_transport_declared(),
+            "database_configured": bool(os.environ.get("DATABASE_URL")),
+            "redis_configured": bool(os.environ.get("REDIS_URL")),
+        },
     })
 
 
