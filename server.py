@@ -29,6 +29,7 @@ injected into every proxied HTML response so users can always return to the wiza
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -94,6 +95,11 @@ else:
 # (key, label, category, is_secret)
 ENV_VARS = [
     ("LLM_MODEL",               "Model",                    "model",     False),
+    ("HERMES_AUTH_PROVIDER",     "OAuth Provider",           "model",     False),
+    ("HERMES_AUTH_MODEL",        "OAuth Model",              "model",     False),
+    ("HERMES_AUTH_BOOTSTRAP_MODE", "Auth Bootstrap Mode",     "model",     False),
+    ("HERMES_AUTH_JSON_BOOTSTRAP", "Auth JSON Bootstrap",     "auth",      True),
+    ("HERMES_AUTH_JSON_B64",     "Auth JSON Bootstrap (B64)", "auth",      True),
     ("OPENROUTER_API_KEY",       "OpenRouter",               "provider",  True),
     ("DEEPSEEK_API_KEY",         "DeepSeek",                 "provider",  True),
     ("DASHSCOPE_API_KEY",        "Qwen Cloud (DashScope)",   "provider",  True),
@@ -209,6 +215,122 @@ def read_env(path: Path) -> dict[str, str]:
     return out
 
 
+def _effective_env() -> dict[str, str]:
+    """Railway/runtime env plus persisted .env, with .env taking precedence."""
+    env = dict(os.environ)
+    env.update(read_env(ENV_FILE))
+    return env
+
+
+def _auth_path() -> Path:
+    return Path(HERMES_HOME) / "auth.json"
+
+
+def _write_auth_json(data: dict) -> None:
+    auth_path = _auth_path()
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        auth_path.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _decode_auth_json_bootstrap(env: dict[str, str] | None = None) -> dict:
+    """Decode raw or base64 auth.json bootstrap payload from env."""
+    env = env or _effective_env()
+    raw = (env.get("HERMES_AUTH_JSON_BOOTSTRAP") or "").strip()
+    raw_b64 = (env.get("HERMES_AUTH_JSON_B64") or "").strip()
+    if raw_b64:
+        raw = base64.b64decode(raw_b64).decode("utf-8")
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Hermes auth bootstrap payload must be a JSON object")
+    providers = data.get("providers")
+    if providers is not None and not isinstance(providers, dict):
+        raise ValueError("Hermes auth bootstrap providers must be a JSON object")
+    return data
+
+
+def _apply_oauth_provider_config(provider: str, model: str = "") -> None:
+    """Persist model/provider selection for OAuth-backed providers."""
+    if not provider:
+        return
+    import yaml
+
+    config_path = Path(HERMES_HOME) / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if config_path.exists():
+        try:
+            loaded = yaml.safe_load(config_path.read_text())
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            pass
+    merged = dict(existing)
+    merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
+    if model:
+        merged_model["default"] = model
+    merged_model["provider"] = provider
+    merged["model"] = merged_model
+    merged.setdefault("data_dir", HERMES_HOME)
+    with config_path.open("w") as f:
+        yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
+
+
+def _apply_auth_json_bootstrap(env: dict[str, str] | None = None) -> dict:
+    """Apply fleet auth bootstrap from Railway env.
+
+    Env contract:
+      - HERMES_AUTH_JSON_BOOTSTRAP: raw auth.json content, or
+      - HERMES_AUTH_JSON_B64: base64-encoded auth.json content
+      - HERMES_AUTH_BOOTSTRAP_MODE: missing|merge|replace|force (default: merge)
+      - HERMES_AUTH_PROVIDER/HERMES_AUTH_MODEL: optional provider/model to persist
+    """
+    env = env or _effective_env()
+    incoming = _decode_auth_json_bootstrap(env)
+    if not incoming:
+        return {"applied": False, "reason": "no_bootstrap"}
+
+    mode = (env.get("HERMES_AUTH_BOOTSTRAP_MODE") or "merge").strip().lower()
+    if mode == "force":
+        mode = "replace"
+    if mode not in {"missing", "merge", "replace"}:
+        raise ValueError("HERMES_AUTH_BOOTSTRAP_MODE must be one of: missing, merge, replace, force")
+
+    existing = _read_auth_json()
+    if mode == "missing" and existing:
+        provider = env.get("HERMES_AUTH_PROVIDER") or existing.get("active_provider") or incoming.get("active_provider") or ""
+        model = env.get("HERMES_AUTH_MODEL") or env.get("LLM_MODEL") or ""
+        if provider and _oauth_provider_has_tokens(provider):
+            _apply_oauth_provider_config(provider, model)
+        return {"applied": False, "reason": "auth_json_exists"}
+
+    if mode == "replace" or not existing:
+        merged = dict(incoming)
+    else:
+        merged = dict(existing)
+        providers = dict(merged.get("providers") if isinstance(merged.get("providers"), dict) else {})
+        providers.update(incoming.get("providers") if isinstance(incoming.get("providers"), dict) else {})
+        if providers:
+            merged["providers"] = providers
+        for key in ("active_provider", "version"):
+            if incoming.get(key) is not None:
+                merged[key] = incoming[key]
+
+    merged["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _write_auth_json(merged)
+
+    provider = env.get("HERMES_AUTH_PROVIDER") or merged.get("active_provider") or incoming.get("active_provider") or ""
+    model = env.get("HERMES_AUTH_MODEL") or env.get("LLM_MODEL") or ""
+    if provider:
+        _apply_oauth_provider_config(str(provider), str(model))
+    return {"applied": True, "mode": mode, "provider": provider, "has_model": bool(model)}
+
+
 def write_config_yaml(data: dict[str, str]) -> None:
     """Write config.yaml — deep-merge template defaults with any existing user/cron-managed sections.
 
@@ -226,7 +348,7 @@ def write_config_yaml(data: dict[str, str]) -> None:
     """
     import yaml  # hermes-agent already pulls pyyaml; deferred import keeps cold start light
 
-    model = data.get("LLM_MODEL", "")
+    model = data.get("LLM_MODEL") or data.get("HERMES_AUTH_MODEL") or ""
     config_path = Path(HERMES_HOME) / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -257,7 +379,13 @@ def write_config_yaml(data: dict[str, str]) -> None:
     # API key is set, the user likely configured an OAuth provider (xai-oauth,
     # qwen-oauth, etc.) via the dashboard's model picker — preserve that value
     # so a container restart doesn't revert it to "auto" and break their session.
-    if any(data.get(k) for k in PROVIDER_KEYS):
+    # Explicit OAuth bootstrap provider wins when tokens are present. This is the
+    # fleet-auth path used by Railway legions: auth.json is delivered through env,
+    # while provider/model selection must be persisted in config.yaml for Hermes.
+    auth_provider = str(data.get("HERMES_AUTH_PROVIDER") or "").strip()
+    if auth_provider and _oauth_provider_has_tokens(auth_provider):
+        merged_model["provider"] = auth_provider
+    elif any(data.get(k) for k in PROVIDER_KEYS):
         merged_model["provider"] = "auto"
     merged["model"] = merged_model
 
@@ -294,11 +422,11 @@ def write_config_yaml(data: dict[str, str]) -> None:
 
 def write_env(path: Path, data: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    cat_order = ["model", "provider", "bedrock", "azure", "custom", "tool",
+    cat_order = ["model", "provider", "auth", "bedrock", "azure", "custom", "tool",
                  "telegram", "discord", "slack", "whatsapp",
                  "email", "mattermost", "matrix", "gateway", "admin"]
     cat_labels = {
-        "model": "Model", "provider": "Providers",
+        "model": "Model", "provider": "Providers", "auth": "Hermes Auth Bootstrap",
         "bedrock": "AWS Bedrock", "azure": "Azure Foundry",
         "custom": "Custom Endpoint", "tool": "Tools",
         "telegram": "Telegram", "discord": "Discord", "slack": "Slack",
@@ -619,10 +747,10 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     if not gateway_enabled():
         return False
     if data is None:
-        data = read_env(ENV_FILE)
+        data = _effective_env()
     yaml_model, yaml_provider = _configured_model_from_yaml()
-    model = data.get("LLM_MODEL") or yaml_model
-    provider = yaml_provider
+    model = data.get("LLM_MODEL") or data.get("HERMES_AUTH_MODEL") or yaml_model
+    provider = data.get("HERMES_AUTH_PROVIDER") or yaml_provider
     has_model = bool(model)
     has_api_key_provider = any(data.get(k) for k in PROVIDER_KEYS)
     # OAuth providers keep credentials in auth.json rather than provider API-key
@@ -866,11 +994,12 @@ class Gateway:
             # (which reads the same file) doesn't shadow our values.
             env = {**os.environ, "HERMES_HOME": HERMES_HOME}
             env.update(read_env(ENV_FILE))
-            model = env.get("LLM_MODEL", "")
+            model = env.get("LLM_MODEL") or env.get("HERMES_AUTH_MODEL") or ""
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
-            print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
-            # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
-            write_config_yaml(read_env(ENV_FILE))
+            auth_provider = env.get("HERMES_AUTH_PROVIDER", "")
+            print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'} | auth_provider={auth_provider or '⚠ NOT SET'}", flush=True)
+            # Write config.yaml so hermes picks up the model/provider (env vars alone aren't always enough)
+            write_config_yaml(env)
             self.proc = await asyncio.create_subprocess_exec(
                 "hermes", "gateway",
                 stdout=asyncio.subprocess.PIPE,
@@ -2035,6 +2164,12 @@ async def lifespan(app):
         asyncio.create_task(dash.start())
     else:
         print("[dashboard] lazy mode enabled — not starting dashboard until first web request", flush=True)
+    try:
+        auth_bootstrap = _apply_auth_json_bootstrap()
+        if auth_bootstrap.get("applied"):
+            print(f"[auth-bootstrap] applied mode={auth_bootstrap.get('mode')} provider={auth_bootstrap.get('provider') or 'unknown'}", flush=True)
+    except Exception as exc:
+        print(f"[auth-bootstrap] failed: {exc!r}", flush=True)
     await auto_start()
     await legion_bus.start()
     try:

@@ -30,14 +30,12 @@ fi
 
 [ ! -f /data/.hermes/.env ] && touch /data/.hermes/.env
 
-# Bootstrap OAuth tokens from env var (e.g. xAI Grok SuperGrok).
-# Set HERMES_AUTH_JSON_BOOTSTRAP to the contents of a locally-generated
-# ~/.hermes/auth.json. Written only once — subsequent token refreshes update
-# the file in place on the persistent volume.
-if [ ! -f /data/.hermes/auth.json ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP}" ]; then
-  printf '%s' "${HERMES_AUTH_JSON_BOOTSTRAP}" > /data/.hermes/auth.json
-  chmod 600 /data/.hermes/auth.json
-fi
+# Fleet OAuth/bootstrap is handled by server.py so it can support raw JSON,
+# base64, merge/replace modes, and provider/model config in one place.
+# Supported env vars:
+#   HERMES_AUTH_JSON_BOOTSTRAP / HERMES_AUTH_JSON_B64
+#   HERMES_AUTH_PROVIDER / HERMES_AUTH_MODEL
+#   HERMES_AUTH_BOOTSTRAP_MODE=missing|merge|replace|force
 
 # Clear any stale gateway PID file left over from the previous container.
 # `hermes gateway` writes /data/.hermes/gateway.pid on start but does not

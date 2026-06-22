@@ -67,6 +67,11 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `ADMIN_USERNAME` | `admin` | Basic auth username |
 | `ADMIN_PASSWORD` | *(auto-generated)* | Basic auth password — if unset, a random password is printed to logs |
 | `HERMES_REF` | *(pinned in Dockerfile)* | Hermes Agent version to install (any upstream git tag/branch). Set this to override the Dockerfile default without editing code — see [Updating Hermes](#updating-hermes). |
+| `HERMES_AUTH_JSON_BOOTSTRAP` | unset | Raw Hermes `auth.json` content for fleet OAuth bootstrap. Secret. |
+| `HERMES_AUTH_JSON_B64` | unset | Base64-encoded Hermes `auth.json` content; preferred for Railway bulk rollout. Secret. |
+| `HERMES_AUTH_PROVIDER` | unset | OAuth provider to activate from the bootstrapped auth file, e.g. `openai-codex`. |
+| `HERMES_AUTH_MODEL` | unset | Model to persist with the OAuth provider, e.g. `gpt-5.5`. |
+| `HERMES_AUTH_BOOTSTRAP_MODE` | `merge` | `missing`, `merge`, `replace`, or `force` behavior for existing `/data/.hermes/auth.json`. |
 
 All other configuration (LLM provider, model, channels, tools) is managed through the admin dashboard.
 
