@@ -172,6 +172,25 @@ CHANNEL_MAP  = {
 }
 
 
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _falsey(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def gateway_enabled() -> bool:
+    """Whether this deployment should run `hermes gateway`."""
+    if _truthy(os.environ.get("WORKER_MODE")):
+        return False
+    if _falsey(os.environ.get("GATEWAY_ENABLED")):
+        return False
+    if _falsey(os.environ.get("TELEGRAM_GATEWAY_ENABLED")):
+        return False
+    return True
+
+
 # ── .env helpers ──────────────────────────────────────────────────────────────
 def read_env(path: Path) -> dict[str, str]:
     if not path.exists():
@@ -596,6 +615,8 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
 
     Used by: GET / redirect, auto_start on boot, admin API status.
     """
+    if not gateway_enabled():
+        return False
     if data is None:
         data = read_env(ENV_FILE)
     yaml_model, yaml_provider = _configured_model_from_yaml()
@@ -1086,8 +1107,14 @@ def _gateway_pidfile_live() -> bool:
 
 
 async def route_health(request: Request):
-    gateway_state = "running" if (gw.state == "running" or _gateway_pidfile_live()) else gw.state
-    return JSONResponse({"status": "ok", "gateway": gateway_state})
+    gateway_state = "running" if gateway_enabled() and (gw.state == "running" or _gateway_pidfile_live()) else gw.state
+    return JSONResponse({
+        "status": "ok",
+        "gateway": gateway_state,
+        "gateway_enabled": gateway_enabled(),
+        "worker_mode": _truthy(os.environ.get("WORKER_MODE")),
+        "transport": os.environ.get("COMMAND_TRANSPORT") or os.environ.get("LEGION_COMMAND_SOURCE") or "",
+    })
 
 
 async def api_config_get(request: Request):
@@ -1151,6 +1178,8 @@ async def api_logs(request: Request):
 
 async def api_gw_start(request: Request):
     if err := guard(request): return err
+    if not gateway_enabled():
+        return JSONResponse({"ok": False, "error": "Gateway disabled for this deployment"}, status_code=409)
     asyncio.create_task(gw.start())
     return JSONResponse({"ok": True})
 
@@ -1163,6 +1192,8 @@ async def api_gw_stop(request: Request):
 
 async def api_gw_restart(request: Request):
     if err := guard(request): return err
+    if not gateway_enabled():
+        return JSONResponse({"ok": False, "error": "Gateway disabled for this deployment"}, status_code=409)
     asyncio.create_task(gw.restart())
     return JSONResponse({"ok": True})
 
@@ -1421,6 +1452,9 @@ async def route_setup_404(request: Request) -> Response:
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
 async def auto_start():
+    if not gateway_enabled():
+        print("[server] Gateway disabled by WORKER_MODE/GATEWAY_ENABLED — running admin/dashboard only.", flush=True)
+        return
     if is_config_complete():
         asyncio.create_task(gw.start())
     else:
