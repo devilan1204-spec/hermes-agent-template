@@ -20,6 +20,32 @@ def test_worker_mode_disables_gateway_readiness(tmp_path, monkeypatch):
     server = load_server(tmp_path, monkeypatch)
     monkeypatch.setenv("WORKER_MODE", "true")
 
+    assert server.worker_mode_enabled() is True
+    assert server.gateway_enabled() is False
+    assert server.is_config_complete({"LLM_MODEL": "gpt-5.5", "ANTHROPIC_API_KEY": "sk-ant-test"}) is False
+
+
+def test_legion_worker_mode_disables_gateway_readiness(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("LEGION_WORKER_MODE", "true")
+
+    assert server.worker_mode_enabled() is True
+    assert server.gateway_enabled() is False
+    assert server.is_config_complete({"LLM_MODEL": "gpt-5.5", "ANTHROPIC_API_KEY": "sk-ant-test"}) is False
+
+
+def test_telegram_gateway_mode_disabled_for_worker_disables_gateway_readiness(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("TELEGRAM_GATEWAY_MODE", "disabled_for_worker")
+
+    assert server.gateway_enabled() is False
+    assert server.is_config_complete({"LLM_MODEL": "gpt-5.5", "ANTHROPIC_API_KEY": "sk-ant-test"}) is False
+
+
+def test_hermes_gateway_enabled_false_disables_gateway_readiness(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_GATEWAY_ENABLED", "false")
+
     assert server.gateway_enabled() is False
     assert server.is_config_complete({"LLM_MODEL": "gpt-5.5", "ANTHROPIC_API_KEY": "sk-ant-test"}) is False
 
