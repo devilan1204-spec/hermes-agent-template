@@ -187,13 +187,25 @@ def _falsey(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"0", "false", "no", "off"}
 
 
+def worker_mode_enabled() -> bool:
+    """Whether this deployment should behave as a command-bus worker."""
+    return (
+        _truthy(os.environ.get("WORKER_MODE"))
+        or _truthy(os.environ.get("LEGION_WORKER_MODE"))
+    )
+
+
 def gateway_enabled() -> bool:
     """Whether this deployment should run `hermes gateway`."""
-    if _truthy(os.environ.get("WORKER_MODE")):
+    if worker_mode_enabled():
         return False
     if _falsey(os.environ.get("GATEWAY_ENABLED")):
         return False
+    if _falsey(os.environ.get("HERMES_GATEWAY_ENABLED")):
+        return False
     if _falsey(os.environ.get("TELEGRAM_GATEWAY_ENABLED")):
+        return False
+    if (os.environ.get("TELEGRAM_GATEWAY_MODE") or "").strip().lower() in {"disabled", "disabled_for_worker", "off"}:
         return False
     return True
 
@@ -1157,9 +1169,10 @@ def _legion_disabled_reason() -> str:
     if not os.environ.get("DATABASE_URL"):
         return "DATABASE_URL not configured"
     if not (
-        _truthy(os.environ.get("WORKER_MODE"))
-        or _truthy(os.environ.get("LEGION_WORKER_MODE"))
+        worker_mode_enabled()
         or _falsey(os.environ.get("TELEGRAM_GATEWAY_ENABLED"))
+        or _falsey(os.environ.get("HERMES_GATEWAY_ENABLED"))
+        or (os.environ.get("TELEGRAM_GATEWAY_MODE") or "").strip().lower() in {"disabled", "disabled_for_worker", "off"}
         or not bool(os.environ.get("TELEGRAM_BOT_TOKEN"))
     ):
         return "gateway service is not in worker polling mode"
@@ -1235,9 +1248,10 @@ class LegionCommandBus:
         # Commander services may still run a gateway. They can use the enqueue
         # API, but should not consume worker tasks unless explicitly requested.
         return (
-            _truthy(os.environ.get("WORKER_MODE"))
-            or _truthy(os.environ.get("LEGION_WORKER_MODE"))
+            worker_mode_enabled()
             or _falsey(os.environ.get("TELEGRAM_GATEWAY_ENABLED"))
+            or _falsey(os.environ.get("HERMES_GATEWAY_ENABLED"))
+            or (os.environ.get("TELEGRAM_GATEWAY_MODE") or "").strip().lower() in {"disabled", "disabled_for_worker", "off"}
             or not bool(os.environ.get("TELEGRAM_BOT_TOKEN"))
         )
 
@@ -1797,7 +1811,7 @@ async def route_health(request: Request):
         "status": "ok",
         "gateway": gateway_state,
         "gateway_enabled": gateway_enabled(),
-        "worker_mode": _truthy(os.environ.get("WORKER_MODE")),
+        "worker_mode": worker_mode_enabled(),
         "transport": _legion_transport(),
         "command_bus": {
             "enabled": bus_enabled,

@@ -19,6 +19,8 @@ def load_server(tmp_path, monkeypatch):
         "WORKER_MODE",
         "LEGION_WORKER_MODE",
         "TELEGRAM_GATEWAY_ENABLED",
+        "HERMES_GATEWAY_ENABLED",
+        "TELEGRAM_GATEWAY_MODE",
         "TELEGRAM_BOT_TOKEN",
         "DATABASE_URL",
         "POSTGRES_SCHEMA",
@@ -66,7 +68,7 @@ def test_legion_bus_enables_for_worker_http_redis_postgres(tmp_path, monkeypatch
     server = load_server(tmp_path, monkeypatch)
     monkeypatch.setenv("COMMAND_TRANSPORT", "http_redis_postgres")
     monkeypatch.setenv("WORKER_MODE", "true")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/db")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:***@localhost:5432/db")
     monkeypatch.setenv("POSTGRES_SCHEMA", "legion_2_dev")
     monkeypatch.setenv("REDIS_KEY_PREFIX", "legion_2_dev")
     monkeypatch.setenv("LEGION_AGENT_ID", "2군단-개발팀")
@@ -79,6 +81,18 @@ def test_legion_bus_enables_for_worker_http_redis_postgres(tmp_path, monkeypatch
     assert status["redis_key_prefix"] == "legion_2_dev"
     assert status["agent_id"] == "2군단-개발팀"
     assert status["transport_configured"] is True
+
+
+def test_legion_bus_enables_for_legion_worker_mode_and_gateway_mode(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("COMMAND_TRANSPORT", "http_redis_postgres")
+    monkeypatch.setenv("LEGION_WORKER_MODE", "true")
+    monkeypatch.setenv("TELEGRAM_GATEWAY_MODE", "disabled_for_worker")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "still-present-but-gateway-disabled")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:***@localhost:5432/db")
+
+    assert server.gateway_enabled() is False
+    assert server.legion_bus.should_start() is True
 
 
 def test_legion_bus_does_not_start_for_http_only_without_database(tmp_path, monkeypatch):
