@@ -1009,7 +1009,25 @@ async def page_index(request: Request):
 
 
 async def route_health(request: Request):
-    return JSONResponse({"status": "ok", "gateway": gw.state})
+    if is_worker_mode():
+        return JSONResponse({
+            "status": "ok",
+            "gateway": "stopped",
+            "gateway_enabled": False,
+            "worker_mode": True,
+            "transport": os.environ.get("COMMAND_TRANSPORT") or os.environ.get("LEGION_REPORT_TRANSPORT") or "http_redis_postgres",
+            "command_bus": {
+                "state": "running" if os.environ.get("COMMAND_TRANSPORT") else "configured",
+                "enabled": True,
+                "polling_enabled": True,
+                "postgres_schema": os.environ.get("POSTGRES_SCHEMA"),
+                "database_configured": bool(os.environ.get("DATABASE_URL")),
+                "redis_configured": bool(os.environ.get("REDIS_URL")),
+                "redis_key_prefix": os.environ.get("REDIS_KEY_PREFIX") or os.environ.get("POSTGRES_SCHEMA"),
+                "last_error": "",
+            },
+        })
+    return JSONResponse({"status": "ok", "gateway": gw.state, "gateway_enabled": gw.state == "running", "worker_mode": False})
 
 
 async def api_config_get(request: Request):
@@ -1333,7 +1351,27 @@ async def route_setup_404(request: Request) -> Response:
 
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
+def is_worker_mode() -> bool:
+    """Return true for legion worker services that must not run Telegram gateway."""
+    truthy = {"1", "true", "yes", "on"}
+    falsey = {"0", "false", "no", "off"}
+    worker_mode = os.environ.get("WORKER_MODE", "").strip().lower() in truthy
+    gateway_enabled = os.environ.get("GATEWAY_ENABLED", "").strip().lower()
+    telegram_gateway_enabled = os.environ.get("TELEGRAM_GATEWAY_ENABLED", "").strip().lower()
+    telegram_mode = os.environ.get("TELEGRAM_GATEWAY_MODE", "").strip().lower()
+    return (
+        worker_mode
+        or gateway_enabled in falsey
+        or telegram_gateway_enabled in falsey
+        or telegram_mode in {"disabled_for_worker", "worker-only", "worker_only", "disabled"}
+    )
+
+
 async def auto_start():
+    if is_worker_mode():
+        gw.state = "stopped"
+        print("[server] Worker mode enabled — Telegram gateway disabled for this service.", flush=True)
+        return
     if is_config_complete():
         asyncio.create_task(gw.start())
     else:
