@@ -239,6 +239,131 @@ def _auth_path() -> Path:
     return Path(HERMES_HOME) / "auth.json"
 
 
+def _config_path() -> Path:
+    return Path(HERMES_HOME) / "config.yaml"
+
+
+def _read_yaml_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _first_nonempty(*values) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _model_metadata() -> dict[str, str | None]:
+    """Return safe provider/model metadata for public health probes."""
+    env = _effective_env()
+    cfg = _read_yaml_file(_config_path())
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    provider = _first_nonempty(
+        model_cfg.get("provider"),
+        env.get("HERMES_AUTH_PROVIDER"),
+        env.get("HERMES_PROVIDER"),
+        env.get("LLM_PROVIDER"),
+        env.get("HERMES_INFERENCE_PROVIDER"),
+    )
+    model = _first_nonempty(
+        model_cfg.get("default"),
+        model_cfg.get("model"),
+        env.get("HERMES_AUTH_MODEL"),
+        env.get("HERMES_MODEL"),
+        env.get("LLM_MODEL"),
+        env.get("HERMES_INFERENCE_MODEL"),
+    )
+    return {"provider": provider, "model": model}
+
+
+def _extract_emailish(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 320:
+        return None
+    if "@" not in text:
+        return None
+    return text
+
+
+def _pick_identity_from_mapping(data: dict) -> str | None:
+    for path in [
+        ("email",),
+        ("google_email",),
+        ("google_id",),
+        ("account", "email"),
+        ("account", "google_email"),
+        ("user", "email"),
+        ("profile", "email"),
+        ("metadata", "email"),
+        ("metadata", "google_email"),
+    ]:
+        node = data
+        for key in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key)
+        ident = _extract_emailish(node)
+        if ident:
+            return ident
+    return None
+
+
+def _openai_oauth_google_id() -> str | None:
+    """Best-effort, secret-safe OpenAI OAuth account identity for /health.
+
+    Hermes auth.json formats differ across versions. We only return explicit
+    email-like identity fields and never expose token-bearing objects.
+    """
+    auth = _read_json_file(_auth_path())
+    providers = auth.get("providers") if isinstance(auth.get("providers"), dict) else {}
+    provider_entry = providers.get("openai-codex") if isinstance(providers.get("openai-codex"), dict) else {}
+    ident = _pick_identity_from_mapping(provider_entry)
+    if ident:
+        return ident
+    pool = auth.get("credential_pool") if isinstance(auth.get("credential_pool"), dict) else {}
+    entries = pool.get("openai-codex")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                ident = _pick_identity_from_mapping(entry)
+                if ident:
+                    return ident
+    return None
+
+
+def _expected_gateway_state() -> str:
+    if worker_mode_enabled():
+        return "stopped"
+    if gateway_enabled():
+        return "running"
+    return "none"
+
+
 def _write_auth_json(data: dict) -> None:
     auth_path = _auth_path()
     auth_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1833,11 +1958,21 @@ def _gateway_pidfile_live() -> bool:
 async def route_health(request: Request):
     gateway_state = "running" if gateway_enabled() and (gw.state == "running" or _gateway_pidfile_live()) else gw.state
     bus_enabled = legion_bus.should_start()
+    model_meta = _model_metadata()
+    provider = model_meta["provider"]
+    model = model_meta["model"]
     return JSONResponse({
         "status": "ok",
         "gateway": gateway_state,
         "gateway_enabled": gateway_enabled(),
+        "system_gateway_status": gateway_state,
+        "expected_gateway": _expected_gateway_state(),
         "worker_mode": worker_mode_enabled(),
+        "provider": provider,
+        "model": model,
+        "main_provider": provider,
+        "main_model": model,
+        "openai_oauth_google_id": _openai_oauth_google_id(),
         "transport": _legion_transport(),
         "command_bus": {
             "enabled": bus_enabled,
@@ -1847,9 +1982,6 @@ async def route_health(request: Request):
             "transport_configured": _legion_transport_declared(),
             "database_configured": bool(os.environ.get("DATABASE_URL")),
             "redis_configured": bool(os.environ.get("REDIS_URL")),
-            "postgres_schema": _legion_schema(),
-            "redis_key_prefix": _legion_redis_prefix(),
-            "last_error": legion_bus.last_error,
         },
     })
 
