@@ -1847,6 +1847,9 @@ async def route_health(request: Request):
             "transport_configured": _legion_transport_declared(),
             "database_configured": bool(os.environ.get("DATABASE_URL")),
             "redis_configured": bool(os.environ.get("REDIS_URL")),
+            "postgres_schema": _legion_schema(),
+            "redis_key_prefix": _legion_redis_prefix(),
+            "last_error": legion_bus.last_error,
         },
     })
 
@@ -2187,6 +2190,22 @@ async def route_setup_404(request: Request) -> Response:
 
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
+def is_worker_mode() -> bool:
+    """Return true for legion worker services that must not run Telegram gateway."""
+    truthy = {"1", "true", "yes", "on"}
+    falsey = {"0", "false", "no", "off"}
+    worker_mode = os.environ.get("WORKER_MODE", "").strip().lower() in truthy
+    gateway_enabled = os.environ.get("GATEWAY_ENABLED", "").strip().lower()
+    telegram_gateway_enabled = os.environ.get("TELEGRAM_GATEWAY_ENABLED", "").strip().lower()
+    telegram_mode = os.environ.get("TELEGRAM_GATEWAY_MODE", "").strip().lower()
+    return (
+        worker_mode
+        or gateway_enabled in falsey
+        or telegram_gateway_enabled in falsey
+        or telegram_mode in {"disabled_for_worker", "worker-only", "worker_only", "disabled"}
+    )
+
+
 async def auto_start():
     if not gateway_enabled():
         print("[server] Gateway disabled by WORKER_MODE/GATEWAY_ENABLED — running admin/dashboard only.", flush=True)
