@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -39,6 +40,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -296,6 +298,138 @@ def _model_metadata() -> dict[str, str | None]:
         env.get("HERMES_INFERENCE_MODEL"),
     )
     return {"provider": provider, "model": model}
+
+
+def _profile_name(env: dict[str, str] | None = None) -> str:
+    env = env or _effective_env()
+    return _first_nonempty(env.get("HERMES_PROFILE"), env.get("HERMES_PROFILE_NAME"), "default") or "default"
+
+
+def _skill_roots(env: dict[str, str] | None = None) -> list[Path]:
+    """Return Hermes skill directories for the active profile without reading secrets."""
+    env = env or _effective_env()
+    home = Path(env.get("HERMES_HOME") or HERMES_HOME)
+    profile = _profile_name(env)
+    roots = [
+        home / "skills",
+        home / "profiles" / profile / "skills",
+    ]
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(root)
+    return deduped
+
+
+def _parse_skill_metadata(path: Path) -> dict:
+    try:
+        if path.suffix.lower() == ".json":
+            data = json.loads(path.read_text(encoding="utf-8"))
+        elif path.suffix.lower() in {".yaml", ".yml"}:
+            import yaml
+
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        elif path.suffix.lower() == ".toml":
+            import tomllib
+
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        else:
+            data = {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _skill_metadata_for(entry: Path) -> dict:
+    if entry.is_file():
+        return _parse_skill_metadata(entry)
+    for name in (
+        "skill.json",
+        "skill.yaml",
+        "skill.yml",
+        "metadata.json",
+        "metadata.yaml",
+        "metadata.yml",
+        "manifest.json",
+        "manifest.yaml",
+        "manifest.yml",
+    ):
+        candidate = entry / name
+        if candidate.exists() and candidate.is_file():
+            return _parse_skill_metadata(candidate)
+    return {}
+
+
+def _category_values(value) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        categories: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                categories.append(item.strip())
+        return categories
+    return []
+
+
+def _safe_skill_inventory() -> dict:
+    """Return a secret-safe inventory summary for /health.
+
+    Only skill names, category labels, a deterministic hash, and source mtime are
+    exposed. Skill bodies, configuration values, and arbitrary metadata fields are
+    intentionally omitted because /health is public on Railway.
+    """
+    entries: dict[str, dict[str, object]] = {}
+    latest_mtime: float | None = None
+    for root in _skill_roots():
+        if not root.exists() or not root.is_dir():
+            continue
+        try:
+            children = sorted(root.iterdir(), key=lambda p: p.name.lower())
+        except Exception:
+            continue
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            if not child.is_dir() and child.suffix.lower() not in {".json", ".yaml", ".yml", ".toml", ".py", ".md"}:
+                continue
+            meta = _skill_metadata_for(child)
+            name = child.stem if child.is_file() else child.name
+            name = str(_first_nonempty(meta.get("name"), name) or name).strip()
+            if not name:
+                continue
+            categories = sorted(set(_category_values(meta.get("category")) + _category_values(meta.get("categories"))))
+            entries[name] = {"name": name, "categories": categories}
+            try:
+                latest_mtime = max(latest_mtime or 0.0, child.stat().st_mtime)
+            except Exception:
+                pass
+
+    records = sorted(entries.values(), key=lambda item: str(item["name"]).lower())
+    names = [str(item["name"]) for item in records]
+    category_set: set[str] = set()
+    for item in records:
+        item_categories = item.get("categories")
+        if isinstance(item_categories, list):
+            for category in item_categories:
+                if isinstance(category, str):
+                    category_set.add(category)
+    categories = sorted(category_set)
+    inventory_hash = hashlib.sha256(json.dumps(records, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    updated_at = None
+    if latest_mtime is not None:
+        updated_at = datetime.fromtimestamp(latest_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "count": len(names),
+        "names": names,
+        "categories": categories,
+        "inventory_hash": inventory_hash,
+        "updated_at": updated_at,
+    }
 
 
 def _extract_emailish(value) -> str | None:
@@ -1972,6 +2106,7 @@ async def route_health(request: Request):
         "model": model,
         "main_provider": provider,
         "main_model": model,
+        "skills": _safe_skill_inventory(),
         "openai_oauth_google_id": _openai_oauth_google_id(),
         "transport": _legion_transport(),
         "command_bus": {
