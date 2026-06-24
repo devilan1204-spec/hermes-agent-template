@@ -278,16 +278,27 @@ def _first_nonempty(*values) -> str | None:
 
 
 def _model_metadata() -> dict[str, str | None]:
-    """Return safe provider/model metadata for public health probes."""
+    """Return safe provider/model metadata for public health probes.
+
+    Persisted config is normally authoritative, but a historical Railway drift
+    mode writes ``model.provider: auto`` even when explicit runtime auth/provider
+    env vars are present. Treat ``auto`` as non-authoritative for health
+    reporting so AgentOps sees the effective configured provider instead of a
+    stale template fallback.
+    """
     env = _effective_env()
     cfg = _read_yaml_file(_config_path())
     model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-    provider = _first_nonempty(
-        model_cfg.get("provider"),
+    configured_provider = _first_nonempty(model_cfg.get("provider"))
+    env_provider = _first_nonempty(
         env.get("HERMES_AUTH_PROVIDER"),
         env.get("HERMES_PROVIDER"),
         env.get("LLM_PROVIDER"),
         env.get("HERMES_INFERENCE_PROVIDER"),
+    )
+    provider = env_provider if str(configured_provider or "").strip().lower() == "auto" and env_provider else _first_nonempty(
+        configured_provider,
+        env_provider,
     )
     model = _first_nonempty(
         model_cfg.get("default"),
@@ -336,6 +347,14 @@ def _parse_skill_metadata(path: Path) -> dict:
             import tomllib
 
             data = tomllib.loads(path.read_text(encoding="utf-8"))
+        elif path.name.lower() == "skill.md":
+            text = path.read_text(encoding="utf-8")
+            data = {}
+            if text.startswith("---\n"):
+                _, frontmatter, _ = text.split("---", 2)
+                import yaml
+
+                data = yaml.safe_load(frontmatter)
         else:
             data = {}
         return data if isinstance(data, dict) else {}
@@ -347,6 +366,8 @@ def _skill_metadata_for(entry: Path) -> dict:
     if entry.is_file():
         return _parse_skill_metadata(entry)
     for name in (
+        "SKILL.md",
+        "skill.md",
         "skill.json",
         "skill.yaml",
         "skill.yml",
@@ -361,6 +382,39 @@ def _skill_metadata_for(entry: Path) -> dict:
         if candidate.exists() and candidate.is_file():
             return _parse_skill_metadata(candidate)
     return {}
+
+
+def _iter_skill_entries(root: Path):
+    """Yield actual skill entries under a Hermes skills root.
+
+    Hermes installations commonly group skills as ``skills/<category>/<skill>/SKILL.md``.
+    A shallow scan misreports category folders as skills, so only yield directories
+    or metadata files that contain skill metadata. Category directories without
+    metadata are traversed recursively.
+    """
+    stack = [root]
+    seen: set[str] = set()
+    while stack:
+        current = stack.pop()
+        try:
+            children = sorted(current.iterdir(), key=lambda p: p.name.lower())
+        except Exception:
+            continue
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            key = str(child)
+            if key in seen:
+                continue
+            seen.add(key)
+            if child.is_dir():
+                if _skill_metadata_for(child):
+                    yield child
+                else:
+                    stack.append(child)
+            elif child.suffix.lower() in {".json", ".yaml", ".yml", ".toml"} or child.name.lower() == "skill.md":
+                if _parse_skill_metadata(child):
+                    yield child
 
 
 def _category_values(value) -> list[str]:
@@ -388,15 +442,7 @@ def _safe_skill_inventory() -> dict:
     for root in _skill_roots():
         if not root.exists() or not root.is_dir():
             continue
-        try:
-            children = sorted(root.iterdir(), key=lambda p: p.name.lower())
-        except Exception:
-            continue
-        for child in children:
-            if child.name.startswith("."):
-                continue
-            if not child.is_dir() and child.suffix.lower() not in {".json", ".yaml", ".yml", ".toml", ".py", ".md"}:
-                continue
+        for child in _iter_skill_entries(root):
             meta = _skill_metadata_for(child)
             name = child.stem if child.is_file() else child.name
             name = str(_first_nonempty(meta.get("name"), name) or name).strip()

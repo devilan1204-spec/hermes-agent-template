@@ -127,3 +127,44 @@ def test_health_exposes_secret_safe_skill_inventory_for_active_profile(tmp_path,
     assert skills["updated_at"].endswith("Z")
     assert "must-not-leak" not in json.dumps(payload, ensure_ascii=False)
     assert "also-must-not-leak" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_skill_inventory_recurses_category_directories_and_reads_skill_md_frontmatter(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    nested_skill = hermes_home / "skills" / "devops" / "railway-hermes-operations"
+    nested_skill.mkdir(parents=True)
+    (nested_skill / "SKILL.md").write_text("""---
+name: railway-hermes-operations
+category: devops
+metadata:
+  secret: must-not-leak
+---
+# Body with token must-not-leak-too
+""", encoding="utf-8")
+
+    payload = decode_json_response(asyncio.run(server.route_health(None)))
+    skills = payload["skills"]
+
+    assert skills["count"] == 1
+    assert skills["names"] == ["railway-hermes-operations"]
+    assert skills["categories"] == ["devops"]
+    assert "devops" not in [name for name in skills["names"] if name != "railway-hermes-operations"]
+    assert "must-not-leak" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_explicit_runtime_env_overrides_persisted_auto_provider(tmp_path, monkeypatch):
+    server = load_server(tmp_path, monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"provider": "auto", "default": "gpt-5.5"},
+    }))
+    monkeypatch.setenv("HERMES_AUTH_PROVIDER", "openai-codex")
+    monkeypatch.setenv("HERMES_AUTH_MODEL", "gpt-5.5")
+
+    payload = decode_json_response(asyncio.run(server.route_health(None)))
+
+    assert payload["provider"] == "openai-codex"
+    assert payload["main_provider"] == "openai-codex"
+    assert payload["model"] == "gpt-5.5"
